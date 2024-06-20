@@ -43,6 +43,8 @@ require (
 	gorm.io/gorm v1.25.7-0.20240204074919-46816ad31dde
 )
 
+replace github.com/flashcatcloud/ibex => github.com/NeganZhao/ibex v0.0.1-test
+
 require (
 	github.com/Azure/go-ntlmssp v0.0.0-20220621081337-cb9428e4ac1e // indirect
 	github.com/beorn7/perks v1.0.1 // indirect
