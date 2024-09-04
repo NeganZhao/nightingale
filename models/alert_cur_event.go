@@ -52,6 +52,8 @@ type AlertCurEvent struct {
 	Tags               string            `json:"-"`                         // for db
 	TagsJSON           []string          `json:"tags" gorm:"-"`             // for fe
 	TagsMap            map[string]string `json:"tags_map" gorm:"-"`         // for internal usage
+	OriginalTags       string            `json:"-"`                         // for db
+	OriginalTagsJSON   []string          `json:"original_tags" gorm:"-"`    // for fe
 	Annotations        string            `json:"-"`                         //
 	AnnotationsJSON    map[string]string `json:"annotations" gorm:"-"`      // for fe
 	IsRecovered        bool              `json:"is_recovered" gorm:"-"`     // for notify.py
@@ -65,6 +67,7 @@ type AlertCurEvent struct {
 	Claimant           string            `json:"claimant" gorm:"-"`
 	SubRuleId          int64             `json:"sub_rule_id" gorm:"-"`
 	ExtraInfo          []string          `json:"extra_info" gorm:"-"`
+	Target             *Target           `json:"target" gorm:"-"`
 }
 
 func (e *AlertCurEvent) TableName() string {
@@ -289,6 +292,7 @@ func (e *AlertCurEvent) ToHis(ctx *ctx.Context) *AlertHisEvent {
 		TriggerTime:      e.TriggerTime,
 		TriggerValue:     e.TriggerValue,
 		Tags:             e.Tags,
+		OriginalTags:     e.OriginalTags,
 		RecoverTime:      recoverTime,
 		LastEvalTime:     e.LastEvalTime,
 		NotifyCurNumber:  e.NotifyCurNumber,
@@ -301,8 +305,13 @@ func (e *AlertCurEvent) DB2FE() error {
 	e.NotifyGroupsJSON = strings.Fields(e.NotifyGroups)
 	e.CallbacksJSON = strings.Fields(e.Callbacks)
 	e.TagsJSON = strings.Split(e.Tags, ",,")
-	json.Unmarshal([]byte(e.Annotations), &e.AnnotationsJSON)
-	json.Unmarshal([]byte(e.RuleConfig), &e.RuleConfigJson)
+	e.OriginalTagsJSON = strings.Split(e.OriginalTags, ",,")
+	if err := json.Unmarshal([]byte(e.Annotations), &e.AnnotationsJSON); err != nil {
+		return err
+	}
+	if err := json.Unmarshal([]byte(e.RuleConfig), &e.RuleConfigJson); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -311,6 +320,7 @@ func (e *AlertCurEvent) FE2DB() {
 	e.NotifyGroups = strings.Join(e.NotifyGroupsJSON, " ")
 	e.Callbacks = strings.Join(e.CallbacksJSON, " ")
 	e.Tags = strings.Join(e.TagsJSON, ",,")
+	e.OriginalTags = strings.Join(e.OriginalTagsJSON, ",,")
 	b, _ := json.Marshal(e.AnnotationsJSON)
 	e.Annotations = string(b)
 
@@ -339,6 +349,39 @@ func (e *AlertCurEvent) DB2Mem() {
 
 		e.TagsMap[arr[0]] = arr[1]
 	}
+
+	// 解决之前数据库中 FirstTriggerTime 为 0 的情况
+	if e.FirstTriggerTime == 0 {
+		e.FirstTriggerTime = e.TriggerTime
+	}
+}
+
+func FillRuleConfigTplName(ctx *ctx.Context, ruleConfig string) (interface{}, bool) {
+	var config RuleConfig
+	err := json.Unmarshal([]byte(ruleConfig), &config)
+	if err != nil {
+		logger.Warningf("failed to unmarshal rule config: %v", err)
+		return nil, false
+	}
+
+	if len(config.TaskTpls) == 0 {
+		return nil, false
+	}
+
+	for i := 0; i < len(config.TaskTpls); i++ {
+		tpl, err := TaskTplGetById(ctx, config.TaskTpls[i].TplId)
+		if err != nil {
+			logger.Warningf("failed to get task tpl by id:%d, %v", config.TaskTpls[i].TplId, err)
+			return nil, false
+		}
+
+		if tpl == nil {
+			logger.Warningf("task tpl not found by id:%d", config.TaskTpls[i].TplId)
+			return nil, false
+		}
+		config.TaskTpls[i].TplName = tpl.Title
+	}
+	return config, true
 }
 
 // for webui
@@ -466,6 +509,11 @@ func AlertCurEventDel(ctx *ctx.Context, ids []int64) error {
 }
 
 func AlertCurEventDelByHash(ctx *ctx.Context, hash string) error {
+	if !ctx.IsCenter {
+		_, err := poster.GetByUrls[string](ctx, "/v1/n9e/alert-cur-events-del-by-hash?hash="+hash)
+		return err
+	}
+
 	return DB(ctx).Where("hash = ?", hash).Delete(&AlertCurEvent{}).Error
 }
 
@@ -584,8 +632,8 @@ func AlertCurEventGetMap(ctx *ctx.Context, cluster string) (map[int64]map[string
 	return ret, nil
 }
 
-func (m *AlertCurEvent) UpdateFieldsMap(ctx *ctx.Context, fields map[string]interface{}) error {
-	return DB(ctx).Model(m).Updates(fields).Error
+func (e *AlertCurEvent) UpdateFieldsMap(ctx *ctx.Context, fields map[string]interface{}) error {
+	return DB(ctx).Model(e).Updates(fields).Error
 }
 
 func AlertCurEventUpgradeToV6(ctx *ctx.Context, dsm map[string]Datasource) error {

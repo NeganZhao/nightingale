@@ -3,12 +3,15 @@ package models
 import (
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/ccfos/nightingale/v6/pkg/ctx"
 	"github.com/ccfos/nightingale/v6/pkg/ormx"
 	"github.com/ccfos/nightingale/v6/pkg/poster"
+	"github.com/ccfos/nightingale/v6/storage"
+	"github.com/redis/go-redis/v9"
 
 	"github.com/pkg/errors"
 	"github.com/tidwall/gjson"
@@ -27,26 +30,32 @@ const (
 	Telegram     = "telegram"
 	Email        = "email"
 	EmailSubject = "mailsubject"
+	Lark         = "lark"
+	LarkCard     = "larkcard"
 
 	DingtalkKey = "dingtalk_robot_token"
 	WecomKey    = "wecom_robot_token"
 	FeishuKey   = "feishu_robot_token"
 	MmKey       = "mm_webhook_url"
 	TelegramKey = "telegram_robot_token"
+	LarkKey     = "lark_robot_token"
 
 	DingtalkDomain = "oapi.dingtalk.com"
 	WecomDomain    = "qyapi.weixin.qq.com"
 	FeishuDomain   = "open.feishu.cn"
+	LarkDomain     = "open.larksuite.com"
 
 	// FeishuCardDomain The domain name of the feishu card is the same as the feishu,distinguished by the parameter
 	FeishuCardDomain = "open.feishu.cn?card=1"
+	LarkCardDomain   = "open.larksuite.com?card=1"
 	TelegramDomain   = "api.telegram.org"
 	IbexDomain       = "ibex"
 	DefaultDomain    = "default"
 )
 
 var (
-	DefaultChannels = []string{Dingtalk, Wecom, Feishu, Mm, Telegram, Email, FeishuCard}
+	DefaultChannels = []string{Dingtalk, Wecom, Feishu, Mm, Telegram, Email, FeishuCard, Lark, LarkCard}
+	DefaultContacts = []string{DingtalkKey, WecomKey, FeishuKey, MmKey, TelegramKey, LarkKey}
 )
 
 type User struct {
@@ -295,6 +304,22 @@ func UserGetById(ctx *ctx.Context, id int64) (*User, error) {
 	return UserGet(ctx, "id=?", id)
 }
 
+func UsersGetByGroupIds(ctx *ctx.Context, groupIds []int64) ([]User, error) {
+	if len(groupIds) == 0 {
+		return nil, nil
+	}
+
+	userIds, err := GroupsMemberIds(ctx, groupIds)
+	if err != nil {
+		return nil, err
+	}
+	users, err := UserGetsByIds(ctx, userIds)
+	if err != nil {
+		return nil, err
+	}
+	return users, nil
+}
+
 func InitRoot(ctx *ctx.Context) {
 	user, err := UserGetByUsername(ctx, "root")
 	if err != nil {
@@ -326,13 +351,106 @@ func InitRoot(ctx *ctx.Context) {
 	fmt.Println("root password init done")
 }
 
-func PassLogin(ctx *ctx.Context, username, pass string) (*User, error) {
+func reachLoginFailCount(ctx *ctx.Context, redisObj storage.Redis, username string, count int64) (bool, error) {
+	key := "/userlogin/errorcount/" + username
+	val, err := redisObj.Get(ctx.GetContext(), key).Result()
+	if err == redis.Nil {
+		return false, nil
+	}
+
+	if err != nil {
+		return false, err
+	}
+
+	c, err := strconv.ParseInt(val, 10, 64)
+	if err != nil {
+		return false, err
+	}
+
+	return c >= count, nil
+}
+
+func incrLoginFailCount(ctx *ctx.Context, redisObj storage.Redis, username string, seconds int64) {
+	key := "/userlogin/errorcount/" + username
+	duration := time.Duration(seconds) * time.Second
+
+	val, err := redisObj.Get(ctx.GetContext(), key).Result()
+	if err == redis.Nil {
+		redisObj.Set(ctx.GetContext(), key, "1", duration)
+		return
+	}
+
+	if err != nil {
+		logger.Warningf("login_fail_count: failed to get redis value. key:%s, error:%s", key, err)
+		redisObj.Set(ctx.GetContext(), key, "1", duration)
+		return
+	}
+
+	count, err := strconv.ParseInt(val, 10, 64)
+	if err != nil {
+		logger.Warningf("login_fail_count: failed to parse int64. key:%s, error:%s", key, err)
+		redisObj.Set(ctx.GetContext(), key, "1", duration)
+		return
+	}
+
+	count++
+	redisObj.Set(ctx.GetContext(), key, fmt.Sprintf("%d", count), duration)
+}
+
+func PassLogin(ctx *ctx.Context, redis storage.Redis, username, pass string) (*User, error) {
+	// 300 5 meaning: 300 seconds, 5 times
+	val, err := ConfigsGet(ctx, "login_fail_count")
+	if err != nil {
+		return nil, err
+	}
+
+	var (
+		needCheck = val != "" // DB 里有配置，说明启用了这个 feature
+		seconds   int64
+		count     int64
+	)
+
+	if needCheck {
+		pair := strings.Fields(val)
+		if len(pair) != 2 {
+			logger.Warningf("login_fail_count config invalid: %s", val)
+			needCheck = false
+		} else {
+			seconds, err = strconv.ParseInt(pair[0], 10, 64)
+			if err != nil {
+				logger.Warningf("login_fail_count seconds invalid: %s", pair[0])
+				needCheck = false
+			}
+
+			count, err = strconv.ParseInt(pair[1], 10, 64)
+			if err != nil {
+				logger.Warningf("login_fail_count count invalid: %s", pair[1])
+				needCheck = false
+			}
+		}
+	}
+
+	if needCheck {
+		reach, err := reachLoginFailCount(ctx, redis, username, count)
+		if err != nil {
+			return nil, err
+		}
+
+		if reach {
+			return nil, fmt.Errorf("reach login fail count")
+		}
+	}
+
 	user, err := UserGetByUsername(ctx, username)
 	if err != nil {
 		return nil, err
 	}
 
 	if user == nil {
+		if needCheck {
+			incrLoginFailCount(ctx, redis, username, seconds)
+		}
+
 		return nil, fmt.Errorf("Username or password invalid")
 	}
 
@@ -342,6 +460,9 @@ func PassLogin(ctx *ctx.Context, username, pass string) (*User, error) {
 	}
 
 	if loginPass != user.Password {
+		if needCheck {
+			incrLoginFailCount(ctx, redis, username, seconds)
+		}
 		return nil, fmt.Errorf("Username or password invalid")
 	}
 
@@ -726,6 +847,9 @@ func (u *User) ExtractToken(key string) (string, bool) {
 		return ret.String(), ret.Exists()
 	case Email:
 		return u.Email, u.Email != ""
+	case Lark, LarkCard:
+		ret := gjson.GetBytes(bs, LarkKey)
+		return ret.String(), ret.Exists()
 	default:
 		return "", false
 	}

@@ -49,6 +49,11 @@ func (rt *Router) targetGets(c *gin.Context) {
 	downtime := ginx.QueryInt64(c, "downtime", 0)
 	dsIds := queryDatasourceIds(c)
 
+	order := ginx.QueryStr(c, "order", "ident")
+	desc := ginx.QueryBool(c, "desc", false)
+
+	hosts := queryStrListField(c, "hosts", ",", " ", "\n")
+
 	var err error
 	if len(bgids) == 0 {
 		user := c.MustGet("user").(*models.User)
@@ -62,11 +67,18 @@ func (rt *Router) targetGets(c *gin.Context) {
 			bgids = append(bgids, 0)
 		}
 	}
-
-	total, err := models.TargetTotal(rt.Ctx, bgids, dsIds, query, downtime)
+	options := []models.BuildTargetWhereOption{
+		models.BuildTargetWhereWithBgids(bgids),
+		models.BuildTargetWhereWithDsIds(dsIds),
+		models.BuildTargetWhereWithQuery(query),
+		models.BuildTargetWhereWithDowntime(downtime),
+		models.BuildTargetWhereWithHosts(hosts),
+	}
+	total, err := models.TargetTotal(rt.Ctx, options...)
 	ginx.Dangerous(err)
 
-	list, err := models.TargetGets(rt.Ctx, bgids, dsIds, query, downtime, limit, ginx.Offset(c, limit))
+	list, err := models.TargetGets(rt.Ctx, limit,
+		ginx.Offset(c, limit), order, desc, options...)
 	ginx.Dangerous(err)
 
 	if err == nil {
@@ -148,7 +160,8 @@ func (rt *Router) targetGetsByService(c *gin.Context) {
 func (rt *Router) targetGetTags(c *gin.Context) {
 	idents := ginx.QueryStr(c, "idents", "")
 	idents = strings.ReplaceAll(idents, ",", " ")
-	lst, err := models.TargetGetTags(rt.Ctx, strings.Fields(idents))
+	ignoreHostTag := ginx.QueryBool(c, "ignore_host_tag", false)
+	lst, err := models.TargetGetTags(rt.Ctx, strings.Fields(idents), ignoreHostTag)
 	ginx.NewRender(c).Data(lst, err)
 }
 
@@ -251,9 +264,11 @@ func (rt *Router) validateTags(tags []string) error {
 }
 
 func (rt *Router) addTagsToTarget(target *models.Target, tags []string) error {
+	hostTagsMap := target.GetHostTagsMap()
 	for _, tag := range tags {
 		tagKey := strings.Split(tag, "=")[0]
-		if strings.Contains(target.Tags, tagKey+"=") {
+		if _, ok := hostTagsMap[tagKey]; ok ||
+			strings.Contains(target.Tags, tagKey+"=") {
 			return fmt.Errorf("duplicate tagkey(%s)", tagKey)
 		}
 	}
